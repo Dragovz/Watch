@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch Together</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { font-family: system-ui, sans-serif; background: #0f1115; color: #e8e8e8; display: flex; flex-direction: column; }
+  input, button { font: inherit; font-size: 16px; border-radius: 10px; border: 1px solid #333842; background: #1a1d23; color: inherit; padding: 10px 12px; }
+  button { background: #e5484d; border-color: #e5484d; font-weight: 600; }
+  button.sec { background: #1a1d23; border-color: #333842; }
+  header { display: flex; gap: 6px; padding: 8px; }
+  header input { flex: 1; min-width: 0; }
+  #playerWrap { position: relative; width: 100%; aspect-ratio: 16/9; background: #000; flex-shrink: 0; }
+  #player, #playerWrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #777; text-align: center; padding: 20px; }
+  #bar { display: flex; gap: 6px; padding: 8px; align-items: center; font-size: 13px; color: #aaa; border-bottom: 1px solid #23262d; }
+  #users { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #msgs { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 15px; min-height: 0; }
+  #msgs .sys { color: #777; font-style: italic; font-size: 13px; }
+  #msgs b { color: #ff8a8d; }
+  #chatForm { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #23262d; padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+  #chatForm input { flex: 1; min-width: 0; }
+  #join { position: fixed; inset: 0; background: #0f1115; display: flex; align-items: center; justify-content: center; z-index: 10; padding: 20px; }
+  #join form { display: flex; flex-direction: column; gap: 12px; width: 100%; max-width: 340px; }
+  #join p { color: #999; margin: 0; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="join">
+  <form id="joinForm">
+    <h2 style="margin:0">🎬 Watch Together</h2>
+    <p id="joinHint">Crie uma sala e mande o link pros amigos.</p>
+    <input id="nameInput" placeholder="Seu nome" maxlength="30" required>
+    <button id="joinBtn">Criar sala</button>
+  </form>
+</div>
+
+<header>
+  <input id="url" placeholder="Cole um link do YouTube">
+  <button id="loadBtn">▶</button>
+</header>
+<div id="playerWrap">
+  <div id="player"></div>
+  <div id="empty">Cole um link do YouTube lá em cima.</div>
+</div>
+<div id="bar">
+  <span id="users">Conectando…</span>
+  <button id="shareBtn" class="sec">Convidar</button>
+</div>
+<div id="msgs"></div>
+<form id="chatForm">
+  <input id="chatInput" placeholder="Mensagem..." autocomplete="off">
+  <button>Enviar</button>
+</form>
+
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const PREFIX = "wt-laerty-";                    // prefixo para os IDs de sala no servidor público do PeerJS
+const roomCode = new URLSearchParams(location.search).get("sala");
+const isHost = !roomCode;
+let myName = "";
+
+if (!isHost) { $("joinHint").textContent = "Você foi convidado pra uma sala."; $("joinBtn").textContent = "Entrar"; }
+try { $("nameInput").value = localStorage.getItem("wt-name") || ""; } catch {}
+
+// ================= REDE (P2P) =================
+// O anfitrião guarda o estado e repassa tudo. Convidados só falam com o anfitrião.
+let peer, hostConn = null;
+const guests = new Map();          // conn.peer -> { conn, name }
+let room = { videoId: null, playing: false, time: 0, updatedAt: Date.now() };
+
+function snapshot() {
+  const el = room.playing ? (Date.now() - room.updatedAt) / 1000 : 0;
+  return { type: "state", videoId: room.videoId, playing: room.playing, time: room.time + el };
+}
+function broadcast(msg, exceptId) {
+  for (const [id, g] of guests) if (id !== exceptId && g.conn.open) g.conn.send(msg);
+  if (exceptId !== "host") receive(msg);   // o anfitrião também "recebe"
+}
+function userList() { return [myName, ...[...guests.values()].map(g => g.name).filter(Boolean)]; }
+
+// Anfitrião processa uma ação (dele mesmo ou de um convidado)
+function hostHandle(msg, fromId, fromName) {
+  if (msg.type === "join") {
+    guests.get(fromId).name = String(msg.name || "Anônimo").slice(0, 30);
+    guests.get(fromId).conn.send(snapshot());
+    broadcast({ type: "system", text: `${guests.get(fromId).name} entrou` });
+    broadcast({ type: "users", list: userList() });
+  } else if (msg.type === "load" && /^[\w-]{11}$/.test(msg.videoId)) {
+    room = { videoId: msg.videoId, playing: false, time: 0, updatedAt: Date.now() };
+    broadcast(snapshot());
+    broadcast({ type: "system", text: `${fromName} trocou o vídeo` });
+  } else if (msg.type === "control" && Number.isFinite(msg.time)) {
+    room = { ...room, playing: !!msg.playing, time: Math.max(0, msg.time), updatedAt: Date.now() };
+    broadcast(snapshot(), fromId);        // quem mandou já está nesse ponto
+  } else if (msg.type === "chat") {
+    const text = String(msg.text || "").trim().slice(0, 500);
+    if (text) broadcast({ type: "chat", name: fromName, text });
+  }
+}
+
+// Envia uma ação: anfitrião processa direto, convidado manda pro anfitrião
+function send(msg) {
+  if (isHost) hostHandle(msg, "host", myName);
+  else if (hostConn?.open) hostConn.send(msg);
+}
+
+function start() {
+  if (isHost) {
+    const code = Math.random().toString(36).slice(2, 8);
+    peer = new Peer(PREFIX + code);
+    peer.on("open", () => {
+      history.replaceState(null, "", "?sala=" + code);
+      addSys("Sala criada! Toque em Convidar e mande o link.");
+      $("users").textContent = "👥 Só você por enquanto";
+    });
+    peer.on("connection", (conn) => {
+      guests.set(conn.peer, { conn, name: "" });
+      conn.on("data", (msg) => hostHandle(msg, conn.peer, guests.get(conn.peer)?.name || "Alguém"));
+      conn.on("close", () => {
+        const g = guests.get(conn.peer); guests.delete(conn.peer);
+        if (g?.name) { broadcast({ type: "system", text: `${g.name} saiu` }); broadcast({ type: "users", list: userList() }); }
+      });
+    });
+  } else {
+    peer = new Peer();
+    peer.on("open", connectToHost);
+  }
+  peer.on("error", (err) => {
+    if (err.type === "peer-unavailable") addSys("Sala não encontrada. O anfitrião precisa estar com o app aberto.");
+    else if (err.type === "unavailable-id") { addSys("Código em uso, criando outro…"); peer.destroy(); start(); }
+    else addSys("Erro de conexão: " + err.type);
+  });
+  peer.on("disconnected", () => { try { peer.reconnect(); } catch {} });
+}
+
+function connectToHost() {
+  hostConn = peer.connect(PREFIX + roomCode, { reliable: true });
+  hostConn.on("open", () => hostConn.send({ type: "join", name: myName }));
+  hostConn.on("data", receive);
+  hostConn.on("close", () => { addSys("Conexão com o anfitrião caiu. Tentando de novo…"); setTimeout(connectToHost, 2000); });
+}
+
+// Mensagens que chegam para todos
+function receive(msg) {
+  if (msg.type === "state") { state = msg; stateAt = Date.now(); applyState(); }
+  else if (msg.type === "chat") addChat(msg.name, msg.text);
+  else if (msg.type === "system") addSys(msg.text);
+  else if (msg.type === "users") $("users").textContent = `👥 ${msg.list.length}: ${msg.list.join(", ")}`;
+}
+
+$("joinForm").onsubmit = (e) => {
+  e.preventDefault();
+  myName = $("nameInput").value.trim().slice(0, 30);
+  if (!myName) return;
+  try { localStorage.setItem("wt-name", myName); } catch {}
+  $("join").remove();
+  start();
+};
+
+// ================= YOUTUBE =================
+let player = null, playerReady = false, state = null, stateAt = 0, ignoreUntil = 0;
+
+function parseYouTube(url) {
+  const m = url.match(/(?:youtu\.be\/|v=|\/embed\/|\/shorts\/|\/live\/)([\w-]{11})/);
+  return m ? m[1] : (/^[\w-]{11}$/.test(url.trim()) ? url.trim() : null);
+}
+const tag = document.createElement("script");
+tag.src = "https://www.youtube.com/iframe_api";
+document.head.appendChild(tag);
+window.onYouTubeIframeAPIReady = () => {
+  player = new YT.Player("player", {
+    playerVars: { playsinline: 1, rel: 0 },
+    events: { onReady: () => { playerReady = true; applyState(); }, onStateChange: onPlayerChange },
+  });
+};
+
+const expectedTime = () => !state ? 0 : state.time + (state.playing ? (Date.now() - stateAt) / 1000 : 0);
+
+function applyState() {
+  if (!playerReady || !state) return;
+  $("empty").style.display = state.videoId ? "none" : "flex";
+  if (!state.videoId) return;
+  ignoreUntil = Date.now() + 1200;
+  if (player.getVideoData()?.video_id !== state.videoId) {
+    player.loadVideoById({ videoId: state.videoId, startSeconds: expectedTime() });
+    if (!state.playing) setTimeout(() => player.pauseVideo(), 700);
+    return;
+  }
+  if (Math.abs(player.getCurrentTime() - expectedTime()) > 1) player.seekTo(expectedTime(), true);
+  state.playing ? player.playVideo() : player.pauseVideo();
+}
+
+function onPlayerChange(e) {
+  if (Date.now() < ignoreUntil) return;
+  if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
+    const playing = e.data === YT.PlayerState.PLAYING, time = player.getCurrentTime();
+    state = { ...(state || {}), playing, time }; stateAt = Date.now();
+    send({ type: "control", playing, time });
+  }
+}
+
+// Corrige quem ficou mais de 2s fora de sincronia
+setInterval(() => {
+  if (!playerReady || !state?.playing || !state.videoId) return;
+  if (player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+  if (Math.abs(player.getCurrentTime() - expectedTime()) > 2) { ignoreUntil = Date.now() + 1200; player.seekTo(expectedTime(), true); }
+}, 3000);
+
+$("loadBtn").onclick = () => {
+  const id = parseYouTube($("url").value);
+  if (!id) return addSys("Link do YouTube inválido");
+  send({ type: "load", videoId: id }); $("url").value = "";
+};
+$("url").onkeydown = (e) => { if (e.key === "Enter") $("loadBtn").click(); };
+
+// ================= CONVITE E CHAT =================
+$("shareBtn").onclick = async () => {
+  const link = location.href;
+  if (navigator.share) { try { await navigator.share({ title: "Bora assistir junto?", url: link }); return; } catch {} }
+  try { await navigator.clipboard.writeText(link); $("shareBtn").textContent = "Copiado!"; }
+  catch { addSys("Link: " + link); }
+  setTimeout(() => $("shareBtn").textContent = "Convidar", 1500);
+};
+function addSys(t) { const d = document.createElement("div"); d.className = "sys"; d.textContent = t; push(d); }
+function addChat(name, text) {
+  const d = document.createElement("div"), b = document.createElement("b");
+  b.textContent = name + ": "; d.append(b, document.createTextNode(text)); push(d);
+}
+function push(d) { $("msgs").appendChild(d); $("msgs").scrollTop = $("msgs").scrollHeight; }
+$("chatForm").onsubmit = (e) => {
+  e.preventDefault();
+  const t = $("chatInput").value.trim();
+  if (t) send({ type: "chat", text: t });
+  $("chatInput").value = "";
+};
+</script>
+</body>
+</html>
